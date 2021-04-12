@@ -11,6 +11,8 @@ uses
 
 type
 
+{$Region 'TStd'}
+
   TStd = record
     // Copies exactly count values from the range beginning
     // at first to the range beginning at result.
@@ -19,6 +21,8 @@ type
     // in the range beginning at first if count > 0.
     class procedure FillN<T>(First: Pointer; Count: Cardinal; const Value: T); static;
   end;
+
+{$EndRegion}
 
 {$Region 'TSpan: a contiguous sequence of objects'}
 
@@ -61,6 +65,7 @@ type
 
 {$Region 'TOperandStack'}
 
+  POperandStack = ^TOperandStack;
   TOperandStack = record
   const
     SmallStorageSize = 128 div sizeof(TValue);
@@ -70,9 +75,33 @@ type
     FBottom: PValue;
     FSmallStorage: array [0..SmallStorageSize] of TValue;
     FLargeStorage: TArray<TValue>;
+    function GetItem(Index: Integer): PValue;
   public
     constructor From(const args: PValue;
       num_args, num_local_variables, max_stack_height: Cardinal);
+    // The current number of items on the stack (aka stack height).
+    function Size: Integer;
+    // Pushes an item on the stack.
+    // The stack max height limit is not checked.
+    procedure Push(Item: TValue); overload;
+    procedure Push(value: Uint64); overload;
+    procedure Push(value: Uint32); overload;
+    // Returns the reference to the top item.
+    // Requires non-empty stack.
+    function Top: PValue;
+    // Returns an item popped from the top of the stack.
+    // Requires non-empty stack.
+    function Pop: TValue;
+    // Returns iterator to the bottom of the stack.
+    function rbegin: PValue;
+    // Returns end iterator counting from the bottom of the stack.
+    function rend: PValue;
+    function local(index: Integer): PValue;
+    // Drop num items from the top of the stack.
+    procedure Drop(num: Cardinal);
+    // Returns the reference to the stack item on given position from the stack top.
+    // Requires index < size().
+    property Items[Index: Integer]: PValue read GetItem;
   end;
 
 {$EndRegion}
@@ -181,6 +210,12 @@ end;
 
 {$Region 'TOperandStack<T>'}
 
+procedure TOperandStack.Drop(num: Cardinal);
+begin
+  Assert(num <= Cardinal(Size));
+  Dec(FTop, num);
+end;
+
 constructor TOperandStack.From(const args: PValue;
   num_args, num_local_variables, max_stack_height: Cardinal);
 var
@@ -191,7 +226,7 @@ begin
   // To avoid potential UB when there are no locals and the stack pointer
   // is set to m_bottom - 1 (i.e. before storage array),
   // we allocate one additional unused stack item.
-  num_locals_adjusted := num_locals + Ord(num_locals = 0);  // Bump to 1 if 0.
+  num_locals_adjusted := num_locals + Cardinal(Ord(num_locals = 0)); // Bump to 1 if 0.
   storage_size_required := num_locals_adjusted + max_stack_height;
 
   if storage_size_required <= SmallStorageSize then
@@ -207,6 +242,64 @@ begin
 
   local_variables := TStd.CopyN<PValue>(args, num_args, FLocals^);
   TStd.FillN<TValue>(local_variables, num_local_variables, TValue.From(0));
+end;
+
+function TOperandStack.GetItem(Index: Integer): PValue;
+begin
+  Assert(index < size);
+  Result := PValue(PByte(FTop) - Index * sizeof(TValue));
+end;
+
+function TOperandStack.local(index: Integer): PValue;
+begin
+  Result := PValue(PByte(FLocals) + index);
+  Assert(NativeUInt(Result) < NativeUInt(FBottom));
+end;
+
+function TOperandStack.Size: Integer;
+begin
+  Result := PByte(FTop) + 1 - PByte(FBottom);
+end;
+
+procedure TOperandStack.Push(Item: TValue);
+begin
+  Inc(FTop, sizeof(TValue));
+  FTop^ := Item;
+end;
+
+procedure TOperandStack.Push(value: Uint32);
+begin
+  Inc(FTop, sizeof(TValue));
+  FTop.i32 := value;
+end;
+
+procedure TOperandStack.Push(value: Uint64);
+begin
+  Inc(FTop, sizeof(TValue));
+  FTop.i64 := value;
+end;
+
+function TOperandStack.rbegin: PValue;
+begin
+  Result := FBottom;
+end;
+
+function TOperandStack.rend: PValue;
+begin
+  Result := PValue(PByte(FTop) + 1);
+end;
+
+function TOperandStack.Top: PValue;
+begin
+  Assert(size <> 0);
+  Result := FTop;
+end;
+
+function TOperandStack.Pop: TValue;
+begin
+  Assert(size <> 0);
+  Result := FTop^;
+  Dec(FTop, sizeof(TValue));
 end;
 
 {$EndRegion}
