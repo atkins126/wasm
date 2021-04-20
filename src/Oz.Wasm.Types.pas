@@ -7,7 +7,7 @@ unit Oz.Wasm.Types;
 interface
 
 uses
-  System.Classes, System.SysUtils, Oz.Wasm.Value;
+  System.Classes, System.SysUtils, Oz.Wasm.Utils, Oz.Wasm.Value;
 
 {$T+}
 {$SCOPEDENUMS ON}
@@ -20,10 +20,20 @@ type
 
   // Value types
   TValType = (
+    none = 0,
     i32 = $7f,
     i64 = $7e,
     f32 = $7d,
     f64 = $7c);
+
+  // Instruction signature. Wasm 1.0 spec only has instructions
+  // which take at most 2 parameters and return at most 1 result.
+  TInstructionType = record
+    inputs: array [0..1] of TValType;
+    outputs: TValType;
+    function inputsSize: Uint32;
+    function outputsSize: Uint32;
+  end;
 
   // Function types classify the signature of functions,
   // mapping a vector of parameters to a vector of results.
@@ -31,24 +41,28 @@ type
   TFuncType = record
     inputs: TArray<TValType>;
     outputs: TArray<TValType>;
-    function Equals(const ft: TFuncType): Boolean;
+    constructor From(const ityp: TInstructionType);
+    function Equals(const sinputs, soutputs: TSpan<TValType>): Boolean; overload;
+    function Equals(const ft: TFuncType): Boolean; overload;
+    class function EqualTypes(const a: TArray<TValType>; b: TSpan<TValType>): Boolean; static;
   end;
 
   // Limits classify the size range of resizeable storage
   // associated with memory types and table types.
   // If no maximum is given, the respective storage can grow to any size.
+  PLimits = ^TLimits;
   TLimits = record
-    min: Cardinal;
-    max: Cardinal;
+    min: Uint32;
+    max: TOptional<Uint32>;
   end;
 
   // All indices are encoded with their respective value.
-  type TTypeIdx = Cardinal;
-  type TFuncIdx = Cardinal;
-  type TTableIdx = Cardinal;
-  type TMemIdx = Cardinal;
-  type TGlobalIdx = Cardinal;
-  type TLocalIdx = Cardinal;
+  type TTypeIdx = Uint32;
+  type TFuncIdx = Uint32;
+  type TTableIdx = Uint32;
+  type TMemIdx = Uint32;
+  type TGlobalIdx = Uint32;
+  type TLocalIdx = Uint32;
 
   // Code Section
   // Each section consists of
@@ -85,7 +99,7 @@ type
     table = 4,
     memory = 5,
     global = 6,
-    export_ = 7,
+    &export = 7,
     start = 8,
     element = 9,
     code = 10,
@@ -93,7 +107,7 @@ type
 
   // Function locals.
   TLocals = record
-    count: Cardinal;
+    count: Uint32;
     typ: TValType;
   end;
 
@@ -112,12 +126,12 @@ type
     kind: TKind;
     case Integer of
       0: (constant: TValue);
-      1: (global_index: Cardinal);
+      1: (globalIndex: Uint32);
   end;
 
   TGlobalType = record
-    value_type: TValType;
-    is_mutable: Boolean;
+    valueType: TValType;
+    isMutable: Boolean;
   end;
 
   TGlobal = record
@@ -133,7 +147,7 @@ type
 
   TDescUnion = record
     case Integer of
-      0: (function_type_index: TTypeIdx);
+      0: (functionTypeIndex: TTypeIdx);
       1: (memory: TMemory);
       2: (global: TGlobalType);
       3: (table: TTable);
@@ -149,7 +163,7 @@ type
   TExport = record
     name: string;
     kind: TExternalKind;
-    index: Cardinal;
+    index: Uint32;
   end;
 
   TElement = record
@@ -159,8 +173,8 @@ type
 
   // The element of the code section.
   TCode = record
-    max_stack_height: Integer;
-    local_count: Cardinal;
+    maxStackHeight: Integer;
+    localCount: Uint32;
     // The instructions bytecode interleaved with decoded immediate values.
     instructions: TArray<Byte>;
   end;
@@ -173,12 +187,61 @@ type
 
 implementation
 
-{ TFuncType }
+{$Region 'TInstructionType'}
+
+function TInstructionType.inputsSize: Uint32;
+begin
+  Result := Ord(inputs[0] <> TValType.none) + Ord(inputs[1] <> TValType.none);
+end;
+
+function TInstructionType.outputsSize: Uint32;
+begin
+  Result := Ord(outputs <> TValType.none);
+end;
+
+{$EndRegion}
+
+{$Region 'TFuncType'}
+
+constructor TFuncType.From(const ityp: TInstructionType);
+begin
+  var n := ityp.inputsSize;
+  SetLength(inputs, n);
+  for var i := 0 to ityp.inputsSize - 1 do
+    inputs[i] := ityp.inputs[i];
+  if ityp.outputs <> TValType.none then
+    outputs[0] := ityp.outputs;
+end;
 
 function TFuncType.Equals(const ft: TFuncType): Boolean;
 begin
-  Result := (inputs = ft.inputs) and (outputs = ft.outputs);
+  Result := (High(inputs) = High(ft.inputs)) and (High(outputs) = High(ft.outputs));
+  if Result then
+  begin
+    for var i := 0 to High(inputs) do
+      if inputs[i] <> ft.inputs[i] then
+        exit(False);
+    for var i := 0 to High(outputs) do
+      if outputs[i] <> ft.outputs[i] then
+        exit(False);
+  end;
 end;
+
+function TFuncType.Equals(const sinputs, soutputs: TSpan<TValType>): Boolean;
+begin
+  Result := EqualTypes(inputs, sinputs) and EqualTypes(outputs, soutputs);
+end;
+
+class function TFuncType.EqualTypes(const a: TArray<TValType>; b: TSpan<TValType>): Boolean;
+begin
+  Result := Length(a) = b.Size;
+  if Result then
+    for var i := 0 to High(a) do
+      if a[i] <> b.Items[i] then
+        exit(False);
+end;
+
+{$EndRegion}
 
 end.
 
