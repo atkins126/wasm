@@ -27,12 +27,16 @@ type
 
 {$EndRegion}
 
-{$Region 'TOptional<T>: '}
+{$Region 'TOptional<T>: optional value'}
 
   TOptional<T> = record
+  var
     value: T;
     hasValue: Boolean;
+  public
     constructor From(value: T);
+    procedure Reset;
+    function Equals(const other: TOptional<T>): Boolean;
   end;
 
 {$EndRegion}
@@ -67,7 +71,9 @@ type
     FSize: Uint32;
     function GetByte(index: Uint32): Byte; inline;
   public
+    class function From(bytes: PByte; size: Uint32): TBytesView; static;
     property size: Uint32 read FSize;
+    property data: PByte read FBytes;
     property bytes[index: Uint32]: Byte read GetByte; default;
   end;
 
@@ -76,18 +82,22 @@ type
 {$Region 'TStack<T>'}
 
   TStack<T> = record
+  type
+    Pt = ^T;
   strict private
     FItems: TArray<T>;
-    function GetItem(Index: Integer): T; inline;
+    function GetItem(Index: Integer): Pt; inline;
     function GetSize: Uint32; inline;
   public
     procedure Push(Item: T);
-    procedure Emplace(const Args: TArray<T>);
+    procedure Emplace(const Value: T); overload;
+    procedure Emplace(const Args: TArray<T>); overload;
     function Pop: T;
-    function Top: T;
+    function Top: Pt;
     function Empty: Boolean;
+    procedure Shrink(newSize: Uint32);
     property Size: Uint32 read GetSize;
-    property Items[Index: Integer]: T read GetItem;
+    property Items[Index: Integer]: Pt read GetItem; default;
   end;
 
 {$EndRegion}
@@ -129,7 +139,7 @@ type
     procedure Drop(num: Uint32);
     // Returns the reference to the stack item on given position from the stack top.
     // Requires index < Size.
-    property Items[Index: Integer]: PValue read GetItem;
+    property Items[Index: Integer]: PValue read GetItem; default;
   end;
 
 {$EndRegion}
@@ -153,7 +163,7 @@ begin
     Inc(PByte(dest), sizeof(T));
     Dec(Count);
   end;
-  Result := @R;
+  Result := dest;
 end;
 
 class function TStd.Copy<T>(const First, Last; var DestFirst): PByte;
@@ -190,6 +200,18 @@ begin
   hasValue := True;
 end;
 
+procedure TOptional<T>.Reset;
+begin
+  Self := Default(TOptional<T>);
+end;
+
+function TOptional<T>.Equals(const other: TOptional<T>): Boolean;
+begin
+  Result := hasValue = other.hasValue;
+  if Result then
+    Result := Self.Equals(other);
+end;
+
 {$EndRegion}
 
 {$Region 'TSpan<T>'}
@@ -214,6 +236,12 @@ end;
 
 {$Region 'TBytesView'}
 
+class function TBytesView.From(bytes: PByte; size: Uint32): TBytesView;
+begin
+  Result.FBytes := bytes;
+  Result.FSize := size;
+end;
+
 function TBytesView.GetByte(index: Uint32): Byte;
 begin
   Result := PByte(FBytes + index)^;
@@ -226,6 +254,11 @@ end;
 procedure TStack<T>.Push(Item: T);
 begin
   FItems := FItems + [Item];
+end;
+
+procedure TStack<T>.Emplace(const Value: T);
+begin
+  FItems := FItems + [Value];
 end;
 
 procedure TStack<T>.Emplace(const Args: TArray<T>);
@@ -242,9 +275,9 @@ begin
   SetLength(FItems, Len);
 end;
 
-function TStack<T>.Top: T;
+function TStack<T>.Top: Pt;
 begin
-  Result := FItems[High(FItems)];
+  Result := @FItems[High(FItems)];
 end;
 
 function TStack<T>.Empty: Boolean;
@@ -252,9 +285,9 @@ begin
   Result := FItems = nil;
 end;
 
-function TStack<T>.GetItem(Index: Integer): T;
+function TStack<T>.GetItem(Index: Integer): Pt;
 begin
-  Result := FItems[Index];
+  Result := @FItems[Integer(Size) - Index - 1];
 end;
 
 function TStack<T>.GetSize: Uint32;
@@ -262,28 +295,25 @@ begin
   Result := Uint32(Length(FItems));
 end;
 
+procedure TStack<T>.Shrink(newSize: Uint32);
+begin
+  Assert(newSize <= Size);
+  SetLength(FItems, newSize);
+end;
+
 {$EndRegion}
 
 {$Region 'TOperandStack<T>'}
 
-procedure TOperandStack.Drop(num: Uint32);
-begin
-  Assert(num <= Uint32(Size));
-  Dec(FTop, num);
-end;
-
 constructor TOperandStack.From(const args: PValue;
   numArgs, numLocalVariables, maxStackHeight: Uint32);
-var
-  numLocals, numLocalsAdjusted, storageSizeRequired: Uint32;
-  localVariables: Pointer;
 begin
-  numLocals := numArgs + numLocalVariables;
+  var numLocals := numArgs + numLocalVariables;
   // To avoid potential UB when there are no locals and the stack pointer
   // is set to FBottom - 1 (i.e. before storage array),
   // we allocate one additional unused stack item.
-  numLocalsAdjusted := numLocals + Uint32(Ord(numLocals = 0)); // Bump to 1 if 0.
-  storageSizeRequired := numLocalsAdjusted + maxStackHeight;
+  var numLocalsAdjusted := numLocals + Uint32(Ord(numLocals = 0)); // Bump to 1 if 0.
+  var storageSizeRequired := numLocalsAdjusted + maxStackHeight;
 
   if storageSizeRequired <= SmallStorageSize then
     FLocals := @FSmallStorage[0]
@@ -293,45 +323,49 @@ begin
     FLocals := @FLargeStorage[0];
   end;
 
-  FBottom := PValue(PByte(FLocals) + numLocalsAdjusted);
-  FTop := PValue(PByte(FBottom) - 1);
+  FBottom := FLocals;
+  Inc(FBottom, numLocalsAdjusted);
+  FTop := FBottom;
+  Dec(FTop);
 
-  localVariables := TStd.CopyN<PValue>(args, numArgs, FLocals^);
+  var localVariables := TStd.CopyN<PValue>(args, numArgs, FLocals^);
   TStd.FillN<TValue>(localVariables, numLocalVariables, TValue.From(0));
-end;
-
-function TOperandStack.GetItem(Index: Integer): PValue;
-begin
-  Assert(index < Size);
-  Result := PValue(PByte(FTop) - Index * sizeof(TValue));
-end;
-
-function TOperandStack.local(index: Integer): PValue;
-begin
-  Result := PValue(PByte(FLocals) + index);
-  Assert(NativeUInt(Result) < NativeUInt(FBottom));
 end;
 
 function TOperandStack.Size: Uint32;
 begin
-  Result := PByte(FTop) + 1 - PByte(FBottom);
+  Result := (PByte(FTop) - PByte(FBottom)) div sizeof(TValue) + 1;
+end;
+
+function TOperandStack.GetItem(index: Integer): PValue;
+begin
+  Assert(Uint32(index) < Size);
+  Result := FTop;
+  Dec(Result, index);
+end;
+
+function TOperandStack.local(index: Integer): PValue;
+begin
+  Result := FLocals;
+  Inc(Result, index);
+  Assert(NativeUInt(Result) < NativeUInt(FBottom));
 end;
 
 procedure TOperandStack.Push(Item: TValue);
 begin
-  Inc(FTop, sizeof(TValue));
+  Inc(FTop, 1);
   FTop^ := Item;
 end;
 
 procedure TOperandStack.Push(value: Uint32);
 begin
-  Inc(FTop, sizeof(TValue));
+  Inc(FTop, 1);
   FTop.i32 := value;
 end;
 
 procedure TOperandStack.Push(value: Uint64);
 begin
-  Inc(FTop, sizeof(TValue));
+  Inc(FTop, 1);
   FTop.i64 := value;
 end;
 
@@ -342,7 +376,8 @@ end;
 
 function TOperandStack.rend: PValue;
 begin
-  Result := PValue(PByte(FTop) + 1);
+  Result := FTop;
+  Inc(Result, 1);
 end;
 
 function TOperandStack.Top: PValue;
@@ -355,7 +390,13 @@ function TOperandStack.Pop: TValue;
 begin
   Assert(Size <> 0);
   Result := FTop^;
-  Dec(FTop, sizeof(TValue));
+  Dec(FTop, 1);
+end;
+
+procedure TOperandStack.Drop(num: Uint32);
+begin
+  Assert(num <= Uint32(Size));
+  Dec(FTop, num);
 end;
 
 {$EndRegion}
