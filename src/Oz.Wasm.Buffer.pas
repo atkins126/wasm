@@ -7,7 +7,7 @@ unit Oz.Wasm.Buffer;
 interface
 
 uses
-  System.SysUtils, Oz.Wasm.Value, Oz.Wasm.Utils;
+  System.SysUtils, System.Math, Oz.Wasm.Operations, Oz.Wasm.Value, Oz.Wasm.Utils;
 
 {$T+}
 {$SCOPEDENUMS ON}
@@ -22,16 +22,20 @@ type
     TParseFunc<T> = function(var buf: TInputBuffer): T;
   private
     FBuf: PByte;
-    FLast: PByte;
+    FEnds: PByte;
     FCurrent: PByte;
     FOwnsData: Boolean;
-    function GetBufferSize: Integer; inline;
+    function GetSize: Integer; inline;
     function GetUnreadSize: Integer; inline;
   public
     class function From(const input: TBytesView): TInputBuffer; overload; static;
     class function From(const Buf: TBytes): TInputBuffer; overload; static;
-    procedure Init(Buf: PByte; BufSize: Integer; OwnsData: Boolean);
+    procedure Init(Buf: PByte; Size: Integer; OwnsData: Boolean);
     procedure Free;
+
+    class function FromHex(const hex: AnsiString): TBytes; static;
+    class function ToHex(const bytes: TBytes): AnsiString; static;
+
     // No more data
     function Eof: Boolean;
     // Read one byte
@@ -67,21 +71,52 @@ type
     // Buffer begin position
     property begins: PByte read FBuf;
     // Buffer end position
-    property ends: PByte read FLast;
+    property ends: PByte read FEnds;
     // Buffer size
-    property bufferSize: Integer read GetBufferSize;
+    property size: Integer read GetSize;
     // The size of the unread part of the buffer
     property unreadSize: Integer read GetUnreadSize;
   end;
 
 {$EndRegion}
 
-function FromHex(const hex: AnsiString): TBytes;
-function ToHex(const bytes: TBytes): AnsiString;
-
 implementation
 
-function FromHex(const hex: AnsiString): TBytes;
+{$Region 'TInputBuffer'}
+
+class function TInputBuffer.From(const input: TBytesView): TInputBuffer;
+begin
+  Result.Init(input.data, input.size, False);
+end;
+
+class function TInputBuffer.From(const Buf: TBytes): TInputBuffer;
+begin
+  Result.Init(@Buf[0], Length(Buf), False);
+end;
+
+procedure TInputBuffer.Init(Buf: PByte; Size: Integer; OwnsData: Boolean);
+begin
+  FOwnsData := OwnsData;
+  if not OwnsData then
+    FBuf := Buf
+  else
+  begin
+    // allocate a buffer and copy the data
+    GetMem(FBuf, Size);
+    Move(Buf^, FBuf^, Size);
+  end;
+  FCurrent := FBuf;
+  FEnds := FBuf + Size;
+end;
+
+procedure TInputBuffer.Free;
+begin
+  if FOwnsData then
+    FreeMem(FBuf);
+  Self := Default(TInputBuffer);
+end;
+
+class function TInputBuffer.FromHex(const hex: AnsiString): TBytes;
 
   function GetHex(var p: PAnsiChar): Integer;
   begin
@@ -104,7 +139,7 @@ begin
     Result[i] := GetHex(p) * 16 + GetHex(p);
 end;
 
-function ToHex(const bytes: TBytes): AnsiString;
+class function TInputBuffer.ToHex(const bytes: TBytes): AnsiString;
 const
   HEX: AnsiString = '0123456789abcdef';
 begin
@@ -120,48 +155,14 @@ begin
   end;
 end;
 
-{$Region 'TInputBuffer'}
-
-class function TInputBuffer.From(const input: TBytesView): TInputBuffer;
+function TInputBuffer.GetSize: Integer;
 begin
-  Result.Init(input.data, input.size, False);
-end;
-
-class function TInputBuffer.From(const Buf: TBytes): TInputBuffer;
-begin
-  Result.Init(@Buf[0], Length(Buf), False);
-end;
-
-procedure TInputBuffer.Init(Buf: PByte; BufSize: Integer; OwnsData: Boolean);
-begin
-  FOwnsData := OwnsData;
-  if not OwnsData then
-    FBuf := Buf
-  else
-  begin
-    // allocate a buffer and copy the data
-    GetMem(FBuf, BufSize);
-    Move(Buf^, FBuf^, BufSize);
-  end;
-  FCurrent := FBuf;
-  FLast := FBuf + BufSize;
-end;
-
-procedure TInputBuffer.Free;
-begin
-  if FOwnsData then
-    FreeMem(FBuf);
-  Self := Default(TInputBuffer);
-end;
-
-function TInputBuffer.GetBufferSize: Integer;
-begin
-  Result := FLast - FBuf;
+  Result := FEnds - FBuf;
 end;
 
 function TInputBuffer.GetUnreadSize: Integer;
 begin
-  Result := FLast - FCurrent;
+  Result := FEnds - FCurrent;
 end;
 
 procedure TInputBuffer.checkUnread(size: Integer);
@@ -172,12 +173,12 @@ end;
 
 function TInputBuffer.Eof: Boolean;
 begin
-  Result := FCurrent >= FLast;
+  Result := FCurrent >= FEnds;
 end;
 
 function TInputBuffer.readByte: Byte;
 begin
-  if FCurrent > FLast then
+  if FCurrent >= FEnds then
     raise EWasmError.Create(EWasmError.EofEncounterd);
   Result := ShortInt(FCurrent^);
   Inc(FCurrent);
@@ -185,13 +186,14 @@ end;
 
 function TInputBuffer.readBytes: TBytes;
 var
-  size: UInt32;
+  size: Int32;
 begin
   size := readLeb32u;
-  // todo: correct check
-  if size <= 0 then
-     raise EWasmError.Create(EWasmError.InvalidSize);
-  if FCurrent > FLast then
+  if size < 0 then
+    raise EWasmError.Create(EWasmError.InvalidSize)
+  else if size = 0 then
+    exit(nil);
+  if FCurrent >= FEnds then
     raise EWasmError.Create(EWasmError.EofEncounterd);
   SetLength(Result, size);
   Move(FCurrent^, Pointer(Result)^, size);
@@ -218,23 +220,35 @@ end;
 
 function TInputBuffer.readLeb32s: Int32;
 var
-  b: ShortInt;
   shift: Integer;
-  r: UInt32;
+  b, expected: Byte;
+  r: Uint32;
 begin
   shift := 0;
   r := 0;
-  repeat
-    if shift >= sizeof(Int32) * 8 then
-      raise EWasmError.Create(EWasmError.MalformedVarint);
+  while shift < 32 do
+  begin
     b := readByte;
-    r := r or ((b and $7f) shl shift);
+    r := r or (Uint32(b and $7f) shl shift);
+    if b and $80 = 0 then
+    begin
+      if shift + 7 < 32 then
+      begin
+        if b and $40 <> 0 then
+          // sign extend
+          r := r or (UInt32.MaxValue shl (shift + 7));
+      end
+      else
+      begin
+        expected := Ash32(r, shift);
+        if expected and $7F <> b then
+          raise EWasmError.Create(EWasmError.MalformedVarint);
+      end;
+      exit(r);
+    end;
     Inc(shift, 7);
-  until b >= 0;
-  // sign extend
-  if (shift < sizeof(Int32) * 8) and (b and $40 <> 0) then
-    r := r or (UInt32.MaxValue shl shift);
-  Result := r;
+  end;
+  raise EWasmError.Create(EWasmError.TooManyBytes);
 end;
 
 function TInputBuffer.readLeb32u: Uint32;
@@ -245,38 +259,52 @@ var
 begin
   r := 0;
   shift := 0;
-  while shift < sizeof(Uint32) * 8 do
+  while shift < 32 do
   begin
     b := readByte;
     r := r or (Uint32(b and $7F) shl shift);
     if b and $80 = 0 then
     begin
-      if b <> r shr shift then
+      if r shr shift <> b then
         raise EWasmError.Create(EWasmError.MalformedVarint);
       exit(r);
     end;
-    shift := shift + 7;
+    Inc(shift, 7);
   end;
   raise EWasmError.Create(EWasmError.TooManyBytes);
 end;
 
 function TInputBuffer.readLeb64s: Int64;
 var
-  b: ShortInt;
   shift: Integer;
-  i64: Int64;
+  b, expected: Byte;
+  r: Uint64;
 begin
-  shift := -7;
-  Result := 0;
-  repeat
-    Inc(shift, 7);
-    if shift >= 64 then
-      EWasmError.Create(EWasmError.MalformedVarint);
+  shift := 0;
+  r := 0;
+  while shift < 64 do
+  begin
     b := readByte;
-    i64 := b and $7f;
-    i64 := i64 shl shift;
-    Result := Result or i64;
-  until b >= 0;
+    r := r or (Uint64(b and $7f) shl shift);
+    if b and $80 = 0 then
+    begin
+      if shift + 7 < 64 then
+      begin
+        if b and $40 <> 0 then
+          // sign extend
+          r := r or (UInt64.MaxValue shl (shift + 7));
+      end
+      else
+      begin
+        expected := Ash64(r, shift);
+        if expected and $7F <> b then
+          raise EWasmError.Create(EWasmError.MalformedVarint);
+      end;
+      exit(r);
+    end;
+    Inc(shift, 7);
+  end;
+  raise EWasmError.Create(EWasmError.TooManyBytes);
 end;
 
 function TInputBuffer.readLeb64u: Uint64;
@@ -287,17 +315,17 @@ var
 begin
   r := 0;
   shift := 0;
-  while shift < sizeof(Uint64) * 8 do
+  while shift < 64 do
   begin
     b := readByte;
     r := r or (Uint64(b and $7F) shl shift);
     if b and $80 = 0 then
     begin
-      if b <> r shr shift then
+      if r shr shift <> b then
         raise EWasmError.Create(EWasmError.MalformedVarint);
       exit(r);
     end;
-    shift := shift + 7;
+    Inc(shift, 7);
   end;
   raise EWasmError.Create(EWasmError.TooManyBytes);
 end;
@@ -344,7 +372,7 @@ function TInputBuffer.startsWith(const bytes: TBytesView): Boolean;
 begin
   if bytes.size = 0 then
     Result := True
-  else if unreadSize >= bytes.size then
+  else if unreadSize >= Integer(bytes.size) then
     Result := CompareMem(FCurrent, bytes.data, bytes.size)
   else
     Result := False;
